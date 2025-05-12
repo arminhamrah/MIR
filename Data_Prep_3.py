@@ -55,10 +55,10 @@ def extract_time_signatures(xml_file_path):
     return sorted_points
 
 
-def extract_notes(midi_path, annotation_path):
+def extract_notes(midi_path, annotation_path, ts_points):
     """
-    Extract per-note data from a MIDI file using downbeat annotations.
-    Returns a DataFrame with columns: measure, note, onset, offset, measure_duration
+    Extract per-note data from a MIDI file using downbeat annotations and normalize measures.
+    Returns a DataFrame with columns: measure, note, onset, offset, measure_start, measure_end
     """
     downbeats = load_downbeats(annotation_path)
     pm = pretty_midi.PrettyMIDI(midi_path)
@@ -68,6 +68,26 @@ def extract_notes(midi_path, annotation_path):
     last_interval = intervals[-1] if intervals else 0.0
     end_times = downbeats[1:] + [downbeats[-1] + last_interval]
 
+    # Build a dict of normalized durations based on time signature
+    def sig_to_duration(ts):
+        if ts is None:
+            return 2.0  # default to 4/4 = 2 seconds
+        try:
+            beats, beat_type = map(int, ts.split("/"))
+            return (60 / 120) * beats * (4 / beat_type)  # normalized to 120 BPM
+        except:
+            return 2.0
+
+    sig_map = {}
+    last_sig = "4/4"
+    for i in range(len(downbeats)):
+        measure_num = i + 1
+        for m, s in reversed(ts_points):
+            if measure_num >= m:
+                last_sig = s
+                break
+        sig_map[measure_num] = sig_to_duration(last_sig)
+
     records = []
     for inst in pm.instruments:
         for note in inst.notes:
@@ -75,18 +95,29 @@ def extract_notes(midi_path, annotation_path):
             idx = bisect.bisect_right(downbeats, onset) - 1
             if idx < 0 or idx >= len(end_times):
                 continue
-            start, end = downbeats[idx], end_times[idx]
-            duration = end - start
-            name = pretty_midi.note_number_to_name(note.pitch)
-            records.append({
-                'measure': idx + 1,
-                'note': name,
-                'onset': onset,
-                'offset': offset,
-                'measure_duration': duration
-            })
-    return pd.DataFrame(records)
+            real_start, real_end = downbeats[idx], end_times[idx]
+            real_duration = real_end - real_start
 
+            norm_duration = sig_map.get(idx + 1, 2.0)
+            rel_onset = (onset - real_start) / real_duration
+            rel_offset = (offset - real_start) / real_duration
+            norm_onset = rel_onset * norm_duration
+            norm_offset = rel_offset * norm_duration
+
+            measure_num = idx + 1
+            measure_start = sum(sig_map.get(m, 2.0) for m in range(1, measure_num))
+            measure_end = measure_start + norm_duration
+
+            records.append({
+                'measure': measure_num,
+                'note': pretty_midi.note_number_to_name(note.pitch),
+                'onset': round(norm_onset + measure_start, 5),
+                'offset': round(norm_offset + measure_start, 5),
+                'measure_start': round(measure_start, 5),
+                'measure_end': round(measure_end, 5)
+})
+            
+    return pd.DataFrame(records).sort_values(by='onset').reset_index(drop=True)
 
 def assign_time_signature(df, ts_points):
     """
@@ -141,7 +172,7 @@ def main():
                 continue
 
             try:
-                df = extract_notes(midi_path, ann_path)
+                df = extract_notes(midi_path, ann_path, ts_points)
                 # Add time signature column
                 df = assign_time_signature(df, ts_points)
                 out_csv = os.path.join(out_dir, f"{base}.csv")
